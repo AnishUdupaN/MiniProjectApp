@@ -13,12 +13,12 @@ import android.provider.Settings
 import android.util.Log
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -30,7 +30,9 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
+import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -78,6 +80,7 @@ data class CheckResponse(
     @SerialName("device_id") val deviceId: String? = null
 )
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SecurityCheckScreen(onChecksCompleted: () -> Unit) {
     val context = LocalContext.current
@@ -87,7 +90,6 @@ fun SecurityCheckScreen(onChecksCompleted: () -> Unit) {
         "Checking Location...",
         "Checking Network...",
         "Checking Device Integrity...",
-        "Checking Data Integrity...",
         "Checking App Integrity"
     )
     var completedChecks by remember { mutableStateOf(0) }
@@ -228,28 +230,37 @@ fun SecurityCheckScreen(onChecksCompleted: () -> Unit) {
         }
     }
 
-    Column(
-        modifier = Modifier.fillMaxSize().padding(16.dp),
-        horizontalAlignment = Alignment.CenterHorizontally
-    ) {
-        Text("Security Checks...", fontSize = 24.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(bottom = 32.dp))
+    Scaffold {
+        innerPadding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(innerPadding)
+                .padding(16.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
+            Text("Security Checks...", fontSize = 24.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(bottom = 32.dp))
 
-        checks.forEachIndexed { index, check ->
-            val isCompleted = index < completedChecks
-            val isFailed = checkFailed && index == (completedChecks - 1)
+            checks.forEachIndexed { index, check ->
+                val isCompleted = index < completedChecks
+                val isFailed = checkFailed && index == (completedChecks - 1)
 
-            if (isCompleted || !checkFailed) {
-                Row(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                    if (isFailed) {
-                        Icon(Icons.Default.Close, "Failed", tint = Color.Red)
-                    } else if (isCompleted) {
-                        Icon(Icons.Default.Check, "Success", tint = Color.Green)
-                    } else {
-                        CircularProgressIndicator(modifier = Modifier.size(24.dp))
-                    }
-                    Spacer(modifier = Modifier.width(16.dp))
-                    Card(modifier = Modifier.fillMaxWidth(), elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)) {
-                        Text(if (isFailed) failureMessage ?: "Check Failed" else check, modifier = Modifier.padding(16.dp), color = if (isFailed) Color.Red else Color.Unspecified)
+                if (isCompleted || !checkFailed) {
+                    Row(modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                        if (isFailed) {
+                            Icon(Icons.Default.Close, "Failed", tint = Color.Red)
+                        } else if (isCompleted) {
+                            Icon(Icons.Default.Check, "Success", tint = Color.Green)
+                        } else {
+                            CircularProgressIndicator(modifier = Modifier.size(24.dp))
+                        }
+                        Spacer(modifier = Modifier.width(16.dp))
+                        Card(modifier = Modifier.fillMaxWidth(), elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)) {
+                            Text(if (isFailed) failureMessage ?: "Check Failed" else check, modifier = Modifier.padding(16.dp), color = if (isFailed) Color.Red else Color.Unspecified)
+                        }
                     }
                 }
             }
