@@ -77,6 +77,7 @@ import io.ktor.serialization.kotlinx.json.json
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -196,7 +197,7 @@ fun MiniProjectApp(onLogout: () -> Unit = {}) {
         if (shouldRetry && fileToRetry != null) {
             downloadAndOpenFile(fileToRetry)
         } else {
-            refreshTrigger++
+            if(fileToRetry?.viewtype == "onetime") refreshTrigger++
         }
     }
 
@@ -388,6 +389,14 @@ fun FileViewerScreen(fileInfo: FileInfo, fileContent: ByteArray, onClose: (Boole
                         }
                     )
                 }
+                "txt", "py", "c", "cpp" -> {
+                    val text = remember(fileContent) { fileContent.decodeToString() }
+                    LazyColumn(modifier = Modifier.padding(16.dp)) {
+                        items(text.lines()) { line ->
+                            Text(line)
+                        }
+                    }
+                }
                 else -> {
                     Text("Unsupported file type.", modifier = Modifier.align(Alignment.Center))
                 }
@@ -413,35 +422,66 @@ fun FileViewerScreen(fileInfo: FileInfo, fileContent: ByteArray, onClose: (Boole
 @Composable
 fun PdfView(fileContent: ByteArray, modifier: Modifier = Modifier, onError: (Exception) -> Unit) {
     val context = LocalContext.current
-    val renderer by produceState<PdfRenderer?>(null, fileContent) {
+    val renderer by produceState<PdfRenderer?>(initialValue = null, keys = arrayOf(fileContent)) {
+        var tempFile: File? = null
         try {
-            val tempFile = File.createTempFile("temp_pdf_", ".pdf", context.cacheDir)
-            tempFile.writeBytes(fileContent)
-            val fileDescriptor = ParcelFileDescriptor.open(tempFile, ParcelFileDescriptor.MODE_READ_ONLY)
-            value = PdfRenderer(fileDescriptor)
-            awaitDispose {
-                value?.close()
-                tempFile.delete()
+            withContext(Dispatchers.IO) {
+                tempFile = File.createTempFile("temp_pdf_", ".pdf", context.cacheDir).apply {
+                    writeBytes(fileContent)
+                }
+                val pfd = ParcelFileDescriptor.open(tempFile, ParcelFileDescriptor.MODE_READ_ONLY)
+                value = PdfRenderer(pfd)
             }
-        } catch (e: IOException) {
+        } catch (e: Exception) {
+            Log.e("PdfView", "Failed to create PdfRenderer", e)
+            withContext(Dispatchers.IO) {
+                tempFile?.delete()
+            }
             onError(e)
             value = null
+        }
+
+        awaitDispose {
+            val currentRenderer = value
+            val temp = tempFile
+            CoroutineScope(Dispatchers.IO).launch {
+                currentRenderer?.close()
+                temp?.delete()
+            }
         }
     }
 
     val currentRenderer = renderer
     if (currentRenderer != null) {
-        LazyColumn(modifier = modifier) {
-            items(currentRenderer.pageCount) { index ->
-                val page = currentRenderer.openPage(index)
-                val bitmap = Bitmap.createBitmap(page.width, page.height, Bitmap.Config.ARGB_8888)
-                page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
-                page.close()
-                Image(
-                    bitmap = bitmap.asImageBitmap(),
-                    contentDescription = "PDF Page ${index + 1}",
-                    modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
-                )
+        Box(modifier = modifier) {
+            LazyColumn {
+                items(currentRenderer.pageCount) { index ->
+                    val pageBitmap by produceState<Bitmap?>(initialValue = null, keys = arrayOf(currentRenderer, index)) {
+                        withContext(Dispatchers.IO) {
+                            val bitmap = synchronized(currentRenderer) {
+                                val page = currentRenderer.openPage(index)
+                                val bmp = Bitmap.createBitmap(page.width, page.height, Bitmap.Config.ARGB_8888)
+                                page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                                page.close()
+                                bmp
+                            }
+                            value = bitmap
+                        }
+                    }
+
+                    val bitmap = pageBitmap
+                    if (bitmap != null) {
+                        Image(
+                            bitmap = bitmap.asImageBitmap(),
+                            contentDescription = "PDF Page ${index + 1}",
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
+                        )
+                    } else {
+                        Box(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+                            Text("Loading page...")
+                        }
+                    }
+                }
             }
         }
     } else {
