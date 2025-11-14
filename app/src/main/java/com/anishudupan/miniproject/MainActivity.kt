@@ -384,6 +384,8 @@ fun ViewOnceFilesScreen(files: List<FileInfo>, onFileClick: (FileInfo) -> Unit, 
 fun FileViewerScreen(fileInfo: FileInfo, fileContent: ByteArray, onClose: (Boolean) -> Unit) {
     BackHandler { onClose(false) }
     var showPdfErrorDialog by remember { mutableStateOf(false) }
+    var showUnsupportedDialog by remember { mutableStateOf(false) }
+
 
     Scaffold(
         topBar = {
@@ -401,7 +403,7 @@ fun FileViewerScreen(fileInfo: FileInfo, fileContent: ByteArray, onClose: (Boole
             val fileExtension = fileInfo.filename.substringAfterLast('.', "").lowercase()
             Log.d("FileViewer", "File extension: '$fileExtension'")
             when (fileExtension) {
-                "jpg", "jpeg", "png" -> {
+                "jpg", "jpeg", "png", "webp", "dng" -> {
                     val bitmap = remember(fileContent) { BitmapFactory.decodeByteArray(fileContent, 0, fileContent.size) }
                     if (bitmap != null) {
                         Image(
@@ -424,16 +426,20 @@ fun FileViewerScreen(fileInfo: FileInfo, fileContent: ByteArray, onClose: (Boole
                         }
                     )
                 }
-                "txt", "py", "c", "cpp" -> {
-                    val text = remember(fileContent) { fileContent.decodeToString() }
-                    LazyColumn(modifier = Modifier.padding(16.dp)) {
-                        items(text.lines()) { line ->
-                            Text(line)
-                        }
-                    }
+                "mp4", "mov", "avi", "webm", "mkv", "pptx", "xlsx" -> {
+                    showUnsupportedDialog = true
                 }
                 else -> {
-                    Text("Unsupported file type.", modifier = Modifier.align(Alignment.Center))
+                    if (fileContent.size < 500_000) { // Less than 0.5 MB
+                        val text = remember(fileContent) { fileContent.decodeToString() }
+                        LazyColumn(modifier = Modifier.padding(16.dp)) {
+                            items(text.lines()) { line ->
+                                Text(line)
+                            }
+                        }
+                    } else {
+                        showUnsupportedDialog = true
+                    }
                 }
             }
         }
@@ -448,6 +454,17 @@ fun FileViewerScreen(fileInfo: FileInfo, fileContent: ByteArray, onClose: (Boole
                 Button(onClick = { onClose(true) }) { Text("Try Again") }
             },
             dismissButton = {
+                Button(onClick = { onClose(false) }) { Text("OK") }
+            }
+        )
+    }
+
+    if (showUnsupportedDialog) {
+        AlertDialog(
+            onDismissRequest = { onClose(false) },
+            title = { Text("Unsupported File") },
+            text = { Text("Cannot open this file type.") },
+            confirmButton = {
                 Button(onClick = { onClose(false) }) { Text("OK") }
             }
         )
