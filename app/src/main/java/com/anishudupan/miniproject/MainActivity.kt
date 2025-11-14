@@ -3,12 +3,20 @@ package com.anishudupan.miniproject
 import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.pdf.PdfRenderer
 import android.os.Bundle
+import android.os.ParcelFileDescriptor
+import android.util.Log
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -16,6 +24,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Logout
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.RemoveRedEye
@@ -25,6 +34,7 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.Scaffold
@@ -34,12 +44,16 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.tooling.preview.Preview
@@ -53,10 +67,21 @@ import io.ktor.client.HttpClient
 import io.ktor.client.call.body
 import io.ktor.client.engine.android.Android
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
+import io.ktor.client.plugins.onDownload
 import io.ktor.client.request.get
+import io.ktor.client.request.post
+import io.ktor.client.request.setBody
+import io.ktor.http.ContentType
+import io.ktor.http.contentType
 import io.ktor.serialization.kotlinx.json.json
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import java.io.File
+import java.io.IOException
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -97,6 +122,9 @@ class MainActivity : ComponentActivity() {
 @Serializable
 data class FileInfo(val filename: String, val viewtype: String)
 
+@Serializable
+data class GetFileRequest(val username: String, val device_id: String, val filename: String)
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MiniProjectApp(onLogout: () -> Unit = {}) {
@@ -105,56 +133,124 @@ fun MiniProjectApp(onLogout: () -> Unit = {}) {
     var viewOnceFiles by remember { mutableStateOf<List<FileInfo>>(emptyList()) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
     var showErrorDialog by remember { mutableStateOf(false) }
+    var refreshTrigger by remember { mutableStateOf(0) }
+    var fileToView by remember { mutableStateOf<Pair<FileInfo, ByteArray>?>(null) }
+    var isDownloading by remember { mutableStateOf(false) }
+    var downloadProgress by remember { mutableStateOf(0f) }
+    val coroutineScope = rememberCoroutineScope()
 
-    LaunchedEffect(Unit) {
-        try {
-            val client = HttpClient(Android) {
-                install(ContentNegotiation) {
-                    json(Json { ignoreUnknownKeys = true })
-                }
+    val json = remember { Json { ignoreUnknownKeys = true; prettyPrint = true } }
+    val client = remember {
+        HttpClient(Android) {
+            install(ContentNegotiation) {
+                json(json)
             }
-            val response: List<FileInfo> = client.get("http://${AppConfig.hostname}/listfiles?username=${AppConfig.username}&device_id=${AppConfig.deviceId}").body()
-            regularFiles = response.filter { it.viewtype == "normal" }
-            viewOnceFiles = response.filter { it.viewtype == "onetime" }
-        } catch (e: Exception) {
-            errorMessage = "Failed to fetch files: ${e.message}"
-            showErrorDialog = true
         }
     }
 
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = { Text(currentDestination.label) },
-                actions = {
-                    IconButton(onClick = onLogout) {
-                        Icon(Icons.AutoMirrored.Filled.Logout, contentDescription = "Logout")
+    val downloadAndOpenFile: (FileInfo) -> Unit = { fileInfo ->
+        coroutineScope.launch {
+            isDownloading = true
+            downloadProgress = 0f
+            var requestJson = ""
+            try {
+                val requestBody = GetFileRequest(AppConfig.username!!, AppConfig.deviceId!!, fileInfo.filename)
+                requestJson = json.encodeToString(requestBody)
+                Log.d("FileDownload", "Request Sent: $requestJson")
+
+                val fileContent: ByteArray = client.post("http://${AppConfig.hostname}/getfile") {
+                    contentType(ContentType.Application.Json)
+                    setBody(requestBody)
+                    onDownload { bytesSentTotal, contentLength ->
+                        if (contentLength > 0) {
+                            downloadProgress = bytesSentTotal.toFloat() / contentLength
+                        }
                     }
-                }
-            )
-        },
-        bottomBar = {
-            NavigationBar {
-                AppDestinations.entries.forEach { destination ->
-                    NavigationBarItem(
-                        icon = { Icon(destination.icon, contentDescription = destination.label) },
-                        label = { Text(destination.label) },
-                        selected = destination == currentDestination,
-                        onClick = { currentDestination = destination }
-                    )
-                }
+                }.body()
+                fileToView = fileInfo to fileContent
+            } catch (e: Exception) {
+                errorMessage = "Failed to download file: ${e.message}\n\nRequest body:\n$requestJson"
+                showErrorDialog = true
+            } finally {
+                isDownloading = false
             }
         }
-    ) { innerPadding ->
-        when (currentDestination) {
-            AppDestinations.REGULAR_DOCUMENTS -> RegularFilesScreen(
-                files = regularFiles,
-                modifier = Modifier.padding(innerPadding)
-            )
-            AppDestinations.VIEW_ONCE_DOCUMENTS -> ViewOnceFilesScreen(
-                files = viewOnceFiles,
-                modifier = Modifier.padding(innerPadding)
-            )
+    }
+
+    LaunchedEffect(refreshTrigger) {
+        if (fileToView == null) { // only refresh if not viewing a file
+            try {
+                val response: List<FileInfo> = client.get("http://${AppConfig.hostname}/listfiles?username=${AppConfig.username}&device_id=${AppConfig.deviceId}").body()
+                regularFiles = response.filter { it.viewtype == "normal" }
+                viewOnceFiles = response.filter { it.viewtype == "onetime" }
+            } catch (e: Exception) {
+                errorMessage = "Failed to fetch files: ${e.message}"
+                showErrorDialog = true
+            }
+        }
+    }
+
+    val onFileClose: (Boolean) -> Unit = { shouldRetry ->
+        val fileToRetry = fileToView?.first
+        fileToView = null
+        if (shouldRetry && fileToRetry != null) {
+            downloadAndOpenFile(fileToRetry)
+        } else {
+            refreshTrigger++
+        }
+    }
+
+    if (fileToView != null) {
+        FileViewerScreen(
+            fileInfo = fileToView!!.first,
+            fileContent = fileToView!!.second,
+            onClose = onFileClose
+        )
+    } else {
+        Scaffold(
+            topBar = {
+                TopAppBar(
+                    title = { Text(currentDestination.label) },
+                    actions = {
+                        IconButton(onClick = onLogout) {
+                            Icon(Icons.AutoMirrored.Filled.Logout, contentDescription = "Logout")
+                        }
+                    }
+                )
+            },
+            bottomBar = {
+                Column {
+                    if (isDownloading) {
+                        LinearProgressIndicator(
+                            modifier = Modifier.fillMaxWidth(),
+                            progress = downloadProgress
+                        )
+                    }
+                    NavigationBar {
+                        AppDestinations.entries.forEach { destination ->
+                            NavigationBarItem(
+                                icon = { Icon(destination.icon, contentDescription = destination.label) },
+                                label = { Text(destination.label) },
+                                selected = destination == currentDestination,
+                                onClick = { currentDestination = destination }
+                            )
+                        }
+                    }
+                }
+            }
+        ) { innerPadding ->
+            when (currentDestination) {
+                AppDestinations.REGULAR_DOCUMENTS -> RegularFilesScreen(
+                    files = regularFiles,
+                    onFileClick = { downloadAndOpenFile(it) },
+                    modifier = Modifier.padding(innerPadding)
+                )
+                AppDestinations.VIEW_ONCE_DOCUMENTS -> ViewOnceFilesScreen(
+                    files = viewOnceFiles,
+                    onFileClick = { downloadAndOpenFile(it) },
+                    modifier = Modifier.padding(innerPadding)
+                )
+            }
         }
     }
 
@@ -189,14 +285,14 @@ enum class AppDestinations(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun RegularFilesScreen(files: List<FileInfo>, modifier: Modifier = Modifier) {
+fun RegularFilesScreen(files: List<FileInfo>, onFileClick: (FileInfo) -> Unit, modifier: Modifier = Modifier) {
     LazyColumn(
         modifier = modifier.fillMaxSize().padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
         items(files) { file ->
             Card(
-                onClick = { /* TODO */ },
+                onClick = { onFileClick(file) },
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Column(
@@ -219,14 +315,14 @@ fun RegularFilesScreen(files: List<FileInfo>, modifier: Modifier = Modifier) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ViewOnceFilesScreen(files: List<FileInfo>, modifier: Modifier = Modifier) {
+fun ViewOnceFilesScreen(files: List<FileInfo>, onFileClick: (FileInfo) -> Unit, modifier: Modifier = Modifier) {
     LazyColumn(
         modifier = modifier.fillMaxSize().padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
         items(files) { file ->
             Card(
-                onClick = { /* TODO */ },
+                onClick = { onFileClick(file) },
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Column(
@@ -243,6 +339,114 @@ fun ViewOnceFilesScreen(files: List<FileInfo>, modifier: Modifier = Modifier) {
                     )
                 }
             }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun FileViewerScreen(fileInfo: FileInfo, fileContent: ByteArray, onClose: (Boolean) -> Unit) {
+    BackHandler { onClose(false) }
+    var showPdfErrorDialog by remember { mutableStateOf(false) }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text(fileInfo.filename) },
+                navigationIcon = {
+                    IconButton(onClick = { onClose(false) }) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                    }
+                }
+            )
+        }
+    ) { innerPadding ->
+        Box(modifier = Modifier.padding(innerPadding).fillMaxSize()) {
+            val fileExtension = fileInfo.filename.substringAfterLast('.', "").lowercase()
+            Log.d("FileViewer", "File extension: '$fileExtension'")
+            when (fileExtension) {
+                "jpg", "jpeg", "png" -> {
+                    val bitmap = remember(fileContent) { BitmapFactory.decodeByteArray(fileContent, 0, fileContent.size) }
+                    if (bitmap != null) {
+                        Image(
+                            bitmap = bitmap.asImageBitmap(),
+                            contentDescription = fileInfo.filename,
+                            modifier = Modifier.fillMaxSize(),
+                            contentScale = ContentScale.Fit
+                        )
+                    } else {
+                        Text("Could not display image.", modifier = Modifier.align(Alignment.Center))
+                    }
+                }
+                "pdf" -> {
+                    PdfView(
+                        fileContent = fileContent, 
+                        modifier = Modifier.fillMaxSize(),
+                        onError = { 
+                            Log.e("FileViewer", "Failed to render PDF", it)
+                            showPdfErrorDialog = true
+                        }
+                    )
+                }
+                else -> {
+                    Text("Unsupported file type.", modifier = Modifier.align(Alignment.Center))
+                }
+            }
+        }
+    }
+
+    if (showPdfErrorDialog) {
+        AlertDialog(
+            onDismissRequest = { onClose(false) },
+            title = { Text("Error") },
+            text = { Text("Could not open file. An error occured") },
+            confirmButton = {
+                Button(onClick = { onClose(true) }) { Text("Try Again") }
+            },
+            dismissButton = {
+                Button(onClick = { onClose(false) }) { Text("OK") }
+            }
+        )
+    }
+}
+
+@Composable
+fun PdfView(fileContent: ByteArray, modifier: Modifier = Modifier, onError: (Exception) -> Unit) {
+    val context = LocalContext.current
+    val renderer by produceState<PdfRenderer?>(null, fileContent) {
+        try {
+            val tempFile = File.createTempFile("temp_pdf_", ".pdf", context.cacheDir)
+            tempFile.writeBytes(fileContent)
+            val fileDescriptor = ParcelFileDescriptor.open(tempFile, ParcelFileDescriptor.MODE_READ_ONLY)
+            value = PdfRenderer(fileDescriptor)
+            awaitDispose {
+                value?.close()
+                tempFile.delete()
+            }
+        } catch (e: IOException) {
+            onError(e)
+            value = null
+        }
+    }
+
+    val currentRenderer = renderer
+    if (currentRenderer != null) {
+        LazyColumn(modifier = modifier) {
+            items(currentRenderer.pageCount) { index ->
+                val page = currentRenderer.openPage(index)
+                val bitmap = Bitmap.createBitmap(page.width, page.height, Bitmap.Config.ARGB_8888)
+                page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                page.close()
+                Image(
+                    bitmap = bitmap.asImageBitmap(),
+                    contentDescription = "PDF Page ${index + 1}",
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
+                )
+            }
+        }
+    } else {
+        Box(modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            Text("Loading PDF...")
         }
     }
 }
