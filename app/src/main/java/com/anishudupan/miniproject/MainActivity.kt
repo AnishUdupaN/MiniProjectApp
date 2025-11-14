@@ -71,7 +71,10 @@ import io.ktor.client.plugins.onDownload
 import io.ktor.client.request.get
 import io.ktor.client.request.post
 import io.ktor.client.request.setBody
+import io.ktor.client.statement.HttpResponse
+import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
+import io.ktor.http.HttpStatusCode
 import io.ktor.http.contentType
 import io.ktor.serialization.kotlinx.json.json
 import kotlinx.coroutines.CoroutineScope
@@ -134,6 +137,10 @@ fun MiniProjectApp(onLogout: () -> Unit = {}) {
     var viewOnceFiles by remember { mutableStateOf<List<FileInfo>>(emptyList()) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
     var showErrorDialog by remember { mutableStateOf(false) }
+    var showDownloadErrorDialog by remember { mutableStateOf(false) }
+    var downloadErrorMessage by remember { mutableStateOf<String?>(null) }
+    var fileToRetryDownload by remember { mutableStateOf<FileInfo?>(null) }
+
     var refreshTrigger by remember { mutableStateOf(0) }
     var fileToView by remember { mutableStateOf<Pair<FileInfo, ByteArray>?>(null) }
     var isDownloading by remember { mutableStateOf(false) }
@@ -159,7 +166,7 @@ fun MiniProjectApp(onLogout: () -> Unit = {}) {
                 requestJson = json.encodeToString(requestBody)
                 Log.d("FileDownload", "Request Sent: $requestJson")
 
-                val fileContent: ByteArray = client.post("http://${AppConfig.hostname}/getfile") {
+                val response: HttpResponse = client.post("http://${AppConfig.hostname}/getfile") {
                     contentType(ContentType.Application.Json)
                     setBody(requestBody)
                     onDownload { bytesSentTotal, contentLength ->
@@ -167,11 +174,22 @@ fun MiniProjectApp(onLogout: () -> Unit = {}) {
                             downloadProgress = bytesSentTotal.toFloat() / contentLength
                         }
                     }
-                }.body()
-                fileToView = fileInfo to fileContent
+                }
+
+                if (response.status == HttpStatusCode.OK) {
+                    fileToView = fileInfo to response.body()
+                } else {
+                    val errorBody = response.bodyAsText()
+                    Log.e("FileDownload", "Error: ${response.status}, Body: $errorBody")
+                    downloadErrorMessage = "Error: ${response.status.value}\n$errorBody"
+                    fileToRetryDownload = fileInfo
+                    showDownloadErrorDialog = true
+                }
             } catch (e: Exception) {
-                errorMessage = "Failed to download file: ${e.message}\n\nRequest body:\n$requestJson"
-                showErrorDialog = true
+                Log.e("FileDownload", "Failed to download file", e)
+                downloadErrorMessage = "Failed to download file: ${e.message}"
+                fileToRetryDownload = fileInfo
+                showDownloadErrorDialog = true
             } finally {
                 isDownloading = false
             }
@@ -197,7 +215,7 @@ fun MiniProjectApp(onLogout: () -> Unit = {}) {
         if (shouldRetry && fileToRetry != null) {
             downloadAndOpenFile(fileToRetry)
         } else {
-            if(fileToRetry?.viewtype == "onetime") refreshTrigger++
+            if (fileToRetry?.viewtype == "onetime") refreshTrigger++
         }
     }
 
@@ -263,6 +281,23 @@ fun MiniProjectApp(onLogout: () -> Unit = {}) {
             title = { Text("Error") },
             text = { Text(errorMessage ?: "An unknown error occurred.") },
             confirmButton = { Button(onClick = { activity?.finish() }) { Text("Exit") } }
+        )
+    }
+
+    if (showDownloadErrorDialog) {
+        AlertDialog(
+            onDismissRequest = { showDownloadErrorDialog = false },
+            title = { Text("Download Failed") },
+            text = { Text(downloadErrorMessage ?: "An unknown error occurred.") },
+            confirmButton = {
+                Button(onClick = {
+                    showDownloadErrorDialog = false
+                    fileToRetryDownload?.let { downloadAndOpenFile(it) }
+                }) { Text("Try Again") }
+            },
+            dismissButton = {
+                Button(onClick = { showDownloadErrorDialog = false }) { Text("OK") }
+            }
         )
     }
 }
