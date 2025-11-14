@@ -88,6 +88,7 @@ fun LoginScreen(onLoginSuccess: () -> Unit) {
 
                 if (response.login == "pass") {
                     AppConfig.hostname = hostname
+                    AppConfig.username = username
                     onLoginSuccess()
                 } else {
                     errorMessage = response.error ?: "Unknown login error"

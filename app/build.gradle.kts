@@ -59,6 +59,7 @@ dependencies {
     implementation("io.ktor:ktor-client-logging:2.3.10")
     implementation("org.slf4j:slf4j-simple:2.0.12")
     implementation("androidx.navigation:navigation-compose:2.7.7")
+    implementation("com.google.android.gms:play-services-location:21.2.0")
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
