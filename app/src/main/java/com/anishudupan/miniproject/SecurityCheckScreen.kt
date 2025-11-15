@@ -9,6 +9,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.location.Location
 import android.location.LocationManager
+import android.os.Build
 import android.provider.Settings
 import android.util.Log
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -39,6 +40,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -53,6 +55,7 @@ import com.anishudupan.miniproject.ui.theme.MiniProjectTheme
 import com.google.android.gms.location.LocationServices
 import com.google.android.gms.location.Priority
 import io.ktor.client.HttpClient
+import io.ktor.client.call.body
 import io.ktor.client.engine.android.Android
 import io.ktor.client.plugins.HttpTimeout
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
@@ -63,11 +66,13 @@ import io.ktor.http.ContentType
 import io.ktor.http.contentType
 import io.ktor.serialization.kotlinx.json.json
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import java.security.MessageDigest
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
@@ -80,17 +85,26 @@ data class CheckResponse(
     @SerialName("device_id") val deviceId: String? = null
 )
 
+@Serializable
+data class ShaCheckRequest(val username: String, val sha256: String)
+
+@Serializable
+data class ShaCheckResponse(val error: String?)
+
+@Serializable
+data class CheckFailedRequest(val username: String, val message: String)
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SecurityCheckScreen(onChecksCompleted: () -> Unit) {
     val context = LocalContext.current
     val fusedLocationClient = remember { LocationServices.getFusedLocationProviderClient(context) }
+    val coroutineScope = rememberCoroutineScope()
 
     val checks = listOf(
-        "Checking Location...",
-        "Checking Network...",
-        "Checking Device Integrity...",
-        "Checking App Integrity"
+        "Device Integrity Check",
+        "App Integrity Check",
+        "Location Check"
     )
     var completedChecks by remember { mutableStateOf(0) }
     var checkFailed by remember { mutableStateOf(false) }
@@ -111,6 +125,8 @@ fun SecurityCheckScreen(onChecksCompleted: () -> Unit) {
                 checkFailed = true
                 failureMessage = "Location permission is required for security checks."
                 showFailureDialog = true
+            } else {
+                triggerRecheck = !triggerRecheck
             }
         }
     )
@@ -122,111 +138,153 @@ fun SecurityCheckScreen(onChecksCompleted: () -> Unit) {
     }
 
     LaunchedEffect(hasLocationPermission, triggerRecheck) {
-        if (hasLocationPermission) {
-            val locationManager = context.getSystemService(Context.LOCATION_SERVICE) as LocationManager
-            val isLocationEnabled = locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)
+        if (!hasLocationPermission) {
+            locationPermissionLauncher.launch(Manifest.permission.ACCESS_FINE_LOCATION)
+            return@LaunchedEffect
+        }
+        completedChecks = 1 // Location Permission Granted
 
-            if (!isLocationEnabled) {
-                showLocationDisabledDialog = true
-                return@LaunchedEffect
+        val locationManager = context.getSystemService(Context.LOCATION_SERVICE) as LocationManager
+        val isLocationEnabled = locationManager.isProviderEnabled(LocationManager.GPS_PROVIDER)
+
+        if (!isLocationEnabled) {
+            showLocationDisabledDialog = true
+            return@LaunchedEffect
+        }
+        completedChecks = 2 // Location Services Enabled
+
+        delay(500)
+        val devOptionsEnabled = Settings.Global.getInt(context.contentResolver, Settings.Global.DEVELOPMENT_SETTINGS_ENABLED, 0) != 0
+        if (devOptionsEnabled) {
+            checkFailed = true
+            failureMessage = "Developer options are enabled. Security check failed. This action has been reported to the admin."
+
+            coroutineScope.launch {
+                try {
+                    val client = HttpClient(Android) { install(ContentNegotiation) { json() } }
+                    client.post("http://${AppConfig.hostname}/checkfailed") {
+                        contentType(ContentType.Application.Json)
+                        setBody(CheckFailedRequest(AppConfig.username!!, "Device Integrity Check Failed."))
+                    }
+                } catch (e: Exception) {
+                    Log.e("SecurityCheckScreen", "Failed to report check failure", e)
+                }
             }
+            showFailureDialog = true
+            return@LaunchedEffect
+        }
+        completedChecks = 3 // Device Integrity Check Passed
 
-            val devOptionsEnabled = Settings.Global.getInt(context.contentResolver, Settings.Global.DEVELOPMENT_SETTINGS_ENABLED, 0) != 0
-            if (devOptionsEnabled) {
-                completedChecks = checks.indexOf("Checking Device Integrity...") + 1
+        delay(500)
+        val appSignature = getAppSignature(context)
+        if (appSignature == null) {
+            checkFailed = true
+            failureMessage = "App integrity check failed: Could not get app signature."
+            showFailureDialog = true
+            return@LaunchedEffect
+        }
+
+        try {
+            val client = HttpClient(Android) { install(ContentNegotiation) { json() } }
+            val response: ShaCheckResponse = client.post("http://${AppConfig.hostname}/shacheck") {
+                contentType(ContentType.Application.Json)
+                setBody(ShaCheckRequest(AppConfig.username!!, appSignature))
+            }.body()
+
+            if (response.error != null) {
                 checkFailed = true
-                failureMessage = "Developer options are enabled. Security check failed."
+                failureMessage = "The app integrity check failed and this incident has been reported to the admin."
                 showFailureDialog = true
                 return@LaunchedEffect
             }
+        } catch (e: Exception) {
+            checkFailed = true
+            failureMessage = "App integrity check failed: ${e.message}"
+            showFailureDialog = true
+            return@LaunchedEffect
+        }
+        completedChecks = 4 // App Integrity Check Passed
 
-            try {
-                @SuppressLint("MissingPermission")
-                val location: Location? = suspendCancellableCoroutine { continuation ->
-                    fusedLocationClient.getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, null)
-                        .addOnSuccessListener { loc: Location? ->
-                            if (continuation.isActive) {
-                                continuation.resume(loc)
-                            }
+        try {
+            @SuppressLint("MissingPermission")
+            val location: Location? = suspendCancellableCoroutine { continuation ->
+                fusedLocationClient.getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, null)
+                    .addOnSuccessListener { loc: Location? ->
+                        if (continuation.isActive) {
+                            continuation.resume(loc)
                         }
-                        .addOnFailureListener { e ->
-                            if (continuation.isActive) {
-                                continuation.resumeWithException(e)
-                            }
+                    }
+                    .addOnFailureListener { e ->
+                        if (continuation.isActive) {
+                            continuation.resumeWithException(e)
                         }
+                    }
+            }
+
+            if (location != null) {
+                val json = Json {
+                    ignoreUnknownKeys = true
+                    coerceInputValues = true
+                    prettyPrint = true
                 }
-
-                if (location != null) {
-                    val json = Json { 
-                        ignoreUnknownKeys = true
-                        coerceInputValues = true
-                        prettyPrint = true
+                val client = HttpClient(Android) {
+                    install(ContentNegotiation) {
+                        json(json)
                     }
-                    val client = HttpClient(Android) {
-                        install(ContentNegotiation) {
-                            json(json)
-                        }
-                        install(HttpTimeout) { requestTimeoutMillis = 5000 }
+                    install(HttpTimeout) { requestTimeoutMillis = 5000 }
+                }
+                val requestBody = CheckRequest(AppConfig.username!!, location.latitude.toString(), location.longitude.toString(), location.altitude.toString())
+                val requestJson = json.encodeToString(requestBody)
+                var responseJson: String? = null
+
+                try {
+                    val httpResponse = client.post("http://${AppConfig.hostname}/checklocation") {
+                        contentType(ContentType.Application.Json)
+                        setBody(requestBody)
                     }
-                    val requestBody = CheckRequest(AppConfig.username!!, location.latitude.toString(), location.longitude.toString(), location.altitude.toString())
-                    val requestJson = json.encodeToString(requestBody)
-                    var responseJson: String? = null
+                    responseJson = httpResponse.bodyAsText()
+                    val response: CheckResponse = json.decodeFromString(responseJson)
 
-                    try {
-                        val httpResponse = client.post("http://${AppConfig.hostname}/check") {
-                            contentType(ContentType.Application.Json)
-                            setBody(requestBody)
-                        }
-                        responseJson = httpResponse.bodyAsText()
-                        val response: CheckResponse = json.decodeFromString(responseJson)
-
-                        if (response.error == null && response.deviceId != null) {
-                            AppConfig.deviceId = response.deviceId
-                            completedChecks++
-                        } else {
-                            checkFailed = true
-                            if (response.deviceId == null) {
-                                failureMessage = "Location Check Failed. You are not in the set Location. This action has been reported to the admin"
-                            } else {
-                                failureMessage = (response.error ?: "Invalid response from server.") +
-                                        "\n\nSent:\n" + requestJson + "\n\nReceived:\n" + responseJson
-                            }
-                            showFailureDialog = true
-                            return@LaunchedEffect
-                        }
-                    } catch (e: Exception) {
-                        Log.e("SecurityCheckScreen", "Location check failed", e)
+                    if (response.error == null && response.deviceId != null) {
+                        AppConfig.deviceId = response.deviceId
+                        completedChecks = 5 // Location Check Passed
+                        delay(500) // Brief pause before navigating
+                        onChecksCompleted()
+                    } else {
                         checkFailed = true
-                        var errorDetails = "Location check failed: ${e.message}"
-                        errorDetails += "\n\nSent:\n$requestJson"
-                        if (responseJson != null) {
-                            errorDetails += "\n\nReceived:\n$responseJson"
+                        if (response.deviceId == null) {
+                            failureMessage = "Location Check Failed. You are not in the set Location. This action has been reported to the admin"
+                        } else {
+                            failureMessage = (response.error ?: "Invalid response from server.") +
+                                    "\n\nSent:\n" + requestJson + "\n\nReceived:\n" + responseJson
                         }
-                        failureMessage = errorDetails
                         showFailureDialog = true
                         return@LaunchedEffect
                     }
-                } else {
+                } catch (e: Exception) {
+                    Log.e("SecurityCheckScreen", "Location check failed", e)
                     checkFailed = true
-                    failureMessage = "Could not retrieve device location. Please ensure location is enabled and try again."
+                    var errorDetails = "Location check failed: ${e.message}"
+                    errorDetails += "\n\nSent:\n$requestJson"
+                    if (responseJson != null) {
+                        errorDetails += "\n\nReceived:\n$responseJson"
+                    }
+                    failureMessage = errorDetails
                     showFailureDialog = true
                     return@LaunchedEffect
                 }
-            } catch (e: Exception) {
-                Log.e("SecurityCheckScreen", "Location check failed", e)
+            } else {
                 checkFailed = true
-                failureMessage = "Location check failed: ${e.message}"
+                failureMessage = "Could not retrieve device location. Please ensure location is enabled and try again."
                 showFailureDialog = true
                 return@LaunchedEffect
             }
-
-            for (i in 1 until checks.size) {
-                delay(800)
-                completedChecks++
-            }
-            onChecksCompleted()
-        } else {
-            locationPermissionLauncher.launch(Manifest.permission.ACCESS_FINE_LOCATION)
+        } catch (e: Exception) {
+            Log.e("SecurityCheckScreen", "Location check failed", e)
+            checkFailed = true
+            failureMessage = "Location check failed: ${e.message}"
+            showFailureDialog = true
+            return@LaunchedEffect
         }
     }
 
@@ -244,28 +302,40 @@ fun SecurityCheckScreen(onChecksCompleted: () -> Unit) {
 
             checks.forEachIndexed { index, check ->
                 val isCompleted = index < completedChecks
-                val isFailed = checkFailed && index == (completedChecks - 1)
+                val isFailed = checkFailed && index == completedChecks
+                val currentCheckIsRunning = index == completedChecks && !checkFailed
 
-                if (isCompleted || !checkFailed) {
-                    Row(modifier = Modifier
+                Row(
+                    modifier = Modifier
                         .fillMaxWidth()
-                        .padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                        if (isFailed) {
-                            Icon(Icons.Default.Close, "Failed", tint = Color.Red)
-                        } else if (isCompleted) {
-                            Icon(Icons.Default.Check, "Success", tint = Color.Green)
-                        } else {
-                            CircularProgressIndicator(modifier = Modifier.size(24.dp))
-                        }
-                        Spacer(modifier = Modifier.width(16.dp))
-                        Card(modifier = Modifier.fillMaxWidth(), elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)) {
-                            Text(if (isFailed) failureMessage ?: "Check Failed" else check, modifier = Modifier.padding(16.dp), color = if (isFailed) Color.Red else Color.Unspecified)
-                        }
+                        .padding(vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    if (isFailed) {
+                        Icon(Icons.Default.Close, "Failed", tint = Color.Red)
+                    } else if (isCompleted) {
+                        Icon(Icons.Default.Check, "Success", tint = Color.Green)
+                    } else if (currentCheckIsRunning) {
+                        CircularProgressIndicator(modifier = Modifier.size(24.dp))
+                    } else { // Not started yet
+                        Spacer(modifier = Modifier.size(24.dp))
+                    }
+                    Spacer(modifier = Modifier.width(16.dp))
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+                    ) {
+                        Text(
+                            if (isFailed) failureMessage ?: "Check Failed" else check,
+                            modifier = Modifier.padding(16.dp),
+                            color = if (isFailed) Color.Red else Color.Unspecified
+                        )
                     }
                 }
             }
         }
     }
+
 
     if (showFailureDialog) {
         val activity = context.findActivity()
@@ -283,19 +353,48 @@ fun SecurityCheckScreen(onChecksCompleted: () -> Unit) {
             title = { Text("Location Services Disabled") },
             text = { Text("This app requires location services to be enabled for security verification. Please enable location services in your device settings.") },
             confirmButton = {
-                Button(onClick = { 
+                Button(onClick = {
                     locationSettingsLauncher.launch(Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS))
-                    showLocationDisabledDialog = false 
+                    showLocationDisabledDialog = false
                 }) { Text("Go to Settings") }
             },
-            dismissButton = { 
-                Button(onClick = { 
+            dismissButton = {
+                Button(onClick = {
                     showLocationDisabledDialog = false
-                    (context.findActivity())?.finish() 
+                    (context.findActivity())?.finish()
                 }) { Text("Exit") }
             }
         )
     }
+}
+
+private fun getAppSignature(context: Context): String? {
+    try {
+        val packageInfo = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            context.packageManager.getPackageInfo(
+                context.packageName,
+                PackageManager.PackageInfoFlags.of(PackageManager.GET_SIGNING_CERTIFICATES.toLong())
+            )
+        } else {
+            @Suppress("DEPRECATION")
+            context.packageManager.getPackageInfo(
+                context.packageName,
+                PackageManager.GET_SIGNING_CERTIFICATES
+            )
+        }
+
+        val signatures = packageInfo.signingInfo?.apkContentsSigners
+        if (!signatures.isNullOrEmpty()) {
+            val signature = signatures[0]
+            val messageDigest = MessageDigest.getInstance("SHA-256")
+            messageDigest.update(signature.toByteArray())
+            val hash = messageDigest.digest()
+            return hash.joinToString("") { "%02x".format(it) }
+        }
+    } catch (e: Exception) {
+        Log.e("SecurityCheckScreen", "Failed to get app signature", e)
+    }
+    return null
 }
 
 private fun Context.findActivity(): Activity? {
