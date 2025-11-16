@@ -65,7 +65,6 @@ import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
 import io.ktor.http.contentType
 import io.ktor.serialization.kotlinx.json.json
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.serialization.SerialName
@@ -153,7 +152,6 @@ fun SecurityCheckScreen(onChecksCompleted: () -> Unit) {
         }
         completedChecks = 2 // Location Services Enabled
 
-        delay(500)
         val devOptionsEnabled = Settings.Global.getInt(context.contentResolver, Settings.Global.DEVELOPMENT_SETTINGS_ENABLED, 0) != 0
         if (devOptionsEnabled) {
             checkFailed = true
@@ -175,7 +173,6 @@ fun SecurityCheckScreen(onChecksCompleted: () -> Unit) {
         }
         completedChecks = 3 // Device Integrity Check Passed
 
-        delay(500)
         val appSignature = getAppSignature(context)
         if (appSignature == null) {
             checkFailed = true
@@ -248,7 +245,6 @@ fun SecurityCheckScreen(onChecksCompleted: () -> Unit) {
                     if (response.error == null && response.deviceId != null) {
                         AppConfig.deviceId = response.deviceId
                         completedChecks = 5 // Location Check Passed
-                        delay(500) // Brief pause before navigating
                         onChecksCompleted()
                     } else {
                         checkFailed = true
