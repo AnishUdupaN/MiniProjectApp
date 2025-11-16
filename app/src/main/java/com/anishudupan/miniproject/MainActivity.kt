@@ -74,7 +74,10 @@ import io.ktor.client.request.get
 import io.ktor.client.request.post
 import io.ktor.client.request.setBody
 import io.ktor.client.statement.HttpResponse
+import io.ktor.client.statement.bodyAsChannel
 import io.ktor.client.statement.bodyAsText
+import io.ktor.utils.io.copyTo
+import java.io.FileOutputStream
 import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.contentType
@@ -134,6 +137,7 @@ data class GetFileRequest(val username: String, val device_id: String, val filen
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MiniProjectApp(onLogout: () -> Unit = {}) {
+    val context = LocalContext.current
     var currentDestination by rememberSaveable { mutableStateOf(AppDestinations.REGULAR_DOCUMENTS) }
     var regularFiles by remember { mutableStateOf<List<FileInfo>>(emptyList()) }
     var viewOnceFiles by remember { mutableStateOf<List<FileInfo>>(emptyList()) }
@@ -144,7 +148,7 @@ fun MiniProjectApp(onLogout: () -> Unit = {}) {
     var fileToRetryDownload by remember { mutableStateOf<FileInfo?>(null) }
 
     var refreshTrigger by remember { mutableStateOf(0) }
-    var fileToView by remember { mutableStateOf<Pair<FileInfo, ByteArray>?>(null) }
+    var fileToView by remember { mutableStateOf<Pair<FileInfo, File>?>(null) }
     var isDownloading by remember { mutableStateOf(false) }
     var downloadProgress by remember { mutableStateOf(0f) }
     val coroutineScope = rememberCoroutineScope()
@@ -179,7 +183,16 @@ fun MiniProjectApp(onLogout: () -> Unit = {}) {
                 }
 
                 if (response.status == HttpStatusCode.OK) {
-                    fileToView = fileInfo to response.body()
+                    val tempFile = File.createTempFile("temp_file_", ".${fileInfo.filename.substringAfterLast('.')}", context.cacheDir)
+                    val channel = response.bodyAsChannel()
+                    val buffer = ByteArray(8192)
+                    FileOutputStream(tempFile).use { output ->
+                        var bytesRead: Int
+                        while (channel.readAvailable(buffer, 0, buffer.size).also { bytesRead = it } > 0) {
+                            output.write(buffer, 0, bytesRead)
+                        }
+                    }
+                    fileToView = fileInfo to tempFile
                 } else {
                     val errorBody = response.bodyAsText()
                     Log.e("FileDownload", "Error: ${response.status}, Body: $errorBody")
@@ -213,7 +226,9 @@ fun MiniProjectApp(onLogout: () -> Unit = {}) {
 
     val onFileClose: (Boolean) -> Unit = { shouldRetry ->
         val fileToRetry = fileToView?.first
+        val fileToDelete = fileToView?.second
         fileToView = null
+        fileToDelete?.delete()
         if (shouldRetry && fileToRetry != null) {
             downloadAndOpenFile(fileToRetry)
         } else {
@@ -224,7 +239,7 @@ fun MiniProjectApp(onLogout: () -> Unit = {}) {
     if (fileToView != null) {
         FileViewerScreen(
             fileInfo = fileToView!!.first,
-            fileContent = fileToView!!.second,
+            file = fileToView!!.second,
             onClose = onFileClose
         )
     } else {
@@ -395,7 +410,7 @@ fun ViewOnceFilesScreen(files: List<FileInfo>, onFileClick: (FileInfo) -> Unit, 
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun FileViewerScreen(fileInfo: FileInfo, fileContent: ByteArray, onClose: (Boolean) -> Unit) {
+fun FileViewerScreen(fileInfo: FileInfo, file: File, onClose: (Boolean) -> Unit) {
     BackHandler { onClose(false) }
     var showPdfErrorDialog by remember { mutableStateOf(false) }
     var showUnsupportedDialog by remember { mutableStateOf(false) }
@@ -418,7 +433,7 @@ fun FileViewerScreen(fileInfo: FileInfo, fileContent: ByteArray, onClose: (Boole
             Log.d("FileViewer", "File extension: '$fileExtension'")
             when (fileExtension) {
                 "jpg", "jpeg", "png", "webp", "dng" -> {
-                    val bitmap = remember(fileContent) { BitmapFactory.decodeByteArray(fileContent, 0, fileContent.size) }
+                    val bitmap = remember(file) { BitmapFactory.decodeFile(file.absolutePath) }
                     if (bitmap != null) {
                         Image(
                             bitmap = bitmap.asImageBitmap(),
@@ -432,9 +447,9 @@ fun FileViewerScreen(fileInfo: FileInfo, fileContent: ByteArray, onClose: (Boole
                 }
                 "pdf" -> {
                     PdfView(
-                        fileContent = fileContent, 
+                        file = file,
                         modifier = Modifier.fillMaxSize(),
-                        onError = { 
+                        onError = {
                             Log.e("FileViewer", "Failed to render PDF", it)
                             showPdfErrorDialog = true
                         }
@@ -444,8 +459,8 @@ fun FileViewerScreen(fileInfo: FileInfo, fileContent: ByteArray, onClose: (Boole
                     showUnsupportedDialog = true
                 }
                 else -> {
-                    if (fileContent.size < 500_000) { // Less than 0.5 MB
-                        val text = remember(fileContent) { fileContent.decodeToString() }
+                    if (file.length() < 500_000) { // Less than 0.5 MB
+                        val text = remember(file) { file.readText() }
                         LazyColumn(modifier = Modifier.padding(16.dp)) {
                             items(text.lines()) { line ->
                                 Text(line)
@@ -486,33 +501,25 @@ fun FileViewerScreen(fileInfo: FileInfo, fileContent: ByteArray, onClose: (Boole
 }
 
 @Composable
-fun PdfView(fileContent: ByteArray, modifier: Modifier = Modifier, onError: (Exception) -> Unit) {
-    val context = LocalContext.current
-    val renderer by produceState<PdfRenderer?>(initialValue = null, keys = arrayOf(fileContent)) {
-        var tempFile: File? = null
+fun PdfView(file: File, modifier: Modifier = Modifier, onError: (Exception) -> Unit) {
+    var pfd by remember { mutableStateOf<ParcelFileDescriptor?>(null) }
+    val renderer by produceState<PdfRenderer?>(initialValue = null, keys = arrayOf(file)) {
         try {
             withContext(Dispatchers.IO) {
-                tempFile = File.createTempFile("temp_pdf_", ".pdf", context.cacheDir).apply {
-                    writeBytes(fileContent)
-                }
-                val pfd = ParcelFileDescriptor.open(tempFile, ParcelFileDescriptor.MODE_READ_ONLY)
-                value = PdfRenderer(pfd)
+                pfd = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
+                value = PdfRenderer(pfd!!)
             }
         } catch (e: Exception) {
             Log.e("PdfView", "Failed to create PdfRenderer", e)
-            withContext(Dispatchers.IO) {
-                tempFile?.delete()
-            }
             onError(e)
             value = null
         }
 
         awaitDispose {
             val currentRenderer = value
-            val temp = tempFile
             CoroutineScope(Dispatchers.IO).launch {
                 currentRenderer?.close()
-                temp?.delete()
+                pfd?.close()
             }
         }
     }
@@ -526,10 +533,13 @@ fun PdfView(fileContent: ByteArray, modifier: Modifier = Modifier, onError: (Exc
                         withContext(Dispatchers.IO) {
                             val bitmap = synchronized(currentRenderer) {
                                 val page = currentRenderer.openPage(index)
-                                val bmp = Bitmap.createBitmap(page.width, page.height, Bitmap.Config.ARGB_8888)
-                                page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
-                                page.close()
-                                bmp
+                                try {
+                                    val bmp = Bitmap.createBitmap(page.width, page.height, Bitmap.Config.ARGB_8888)
+                                    page.render(bmp, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                                    bmp
+                                } finally {
+                                    page.close()
+                                }
                             }
                             value = bitmap
                         }
